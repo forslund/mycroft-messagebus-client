@@ -13,6 +13,7 @@
 # limitations under the License.
 #
 import json
+import inspect
 from copy import deepcopy
 
 
@@ -162,3 +163,13 @@ class Message:
             del new_context['target']
 
         return Message(msg_type, data, context=new_context)
+
+
+def dig_for_message(limit=10):
+    """Dig Through the stack for message."""
+    stack = inspect.stack()
+    stack = stack if len(stack) < limit else stack[:limit]
+    local_vars = [frame[0].f_locals for frame in stack]
+    for l in local_vars:
+        if 'message' in l and isinstance(l['message'], Message):
+            return l['message']
