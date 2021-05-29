@@ -23,13 +23,14 @@ import logging
 import time
 import traceback
 from threading import Event, Thread
+from uuid import uuid4
 
 from pyee import ExecutorEventEmitter
 from websocket import (WebSocketApp,
                        WebSocketConnectionClosedException,
                        WebSocketException)
 
-from mycroft_bus_client.message import Message
+from mycroft_bus_client.message import Message, CollectionMessage
 from mycroft_bus_client.util import create_echo_function
 
 LOG = logging.getLogger(__name__)
@@ -80,6 +81,76 @@ class MessageWaiter:
                 # the handler is removed
                 pass
         return self.received_msg
+
+
+class MessageCollector:
+    """Collect multiple response.
+
+    This class encapsulates the logic for collecting messages from
+    multiple handlers returning the list of all answers.
+
+    Argunments:
+        bus: Bus to check for messages on
+        message (Message): message to send
+        min_timeout (int/float): Minimum time to wait for a response
+        max_timeout (int/float): Maximum allowed time to wait for an answer
+        direct_return_func (callable): Optional function for allowing an
+            early return (not all registered handlers need to respond)
+    """
+    def __init__(self, bus, message, min_timeout, max_timeout, direct_return):
+        self.bus = bus
+        self.min_timeout = min_timeout
+        self.max_timeout = max_timeout
+        self.direct_return = direct_return
+
+        # Create an unique id for the collection
+        self.collect_id = str(uuid4())
+        self.handlers = {}
+        self.all_collected = Event()
+        self.message = message
+        self.message.context['__collect_id__'] = self.collect_id
+
+    def _register_handler(self, msg):
+        if msg.data['query'] == self.collect_id:
+            self.handlers[msg.data['handler']] = None
+
+    def _receive_response(self, msg):
+        if msg.data['query'] == self.collect_id:
+            self.handlers[msg.data['handler']] = msg
+            # If all registered handlers have responded with an answer
+            # or a VERY good answer has been found indicate end of wait.
+            if (all([self.handlers[k] is not None for k in self.handlers]) or
+                    self.direct_return_func(msg)):
+                self.all_collected.set()
+
+    def _setup_collection_handlers(self):
+        base_msg_type = self.message.msg_type
+        self.bus.on(base_msg_type + '.handling', self._register_handler)
+        self.bus.on(base_msg_type + '.response', self._receive_response)
+
+    def _teardown_collection_handlers(self):
+        base_msg_type = self.message.msg_type
+        self.bus.remove(base_msg_type + '.handling', self._register_handler)
+        self.bus.remove(base_msg_type + '.response', self._receive_response)
+
+    def wait(self):
+        # Register handler to capture handlers trying to provide answer
+        self._setup_collection_handlers()
+        self.bus.emit(self.message)
+
+        time.sleep(self.min_timeout)
+        if len(self.handlers) == 0:
+            # No handlers has registered to answer the query
+            result = []
+        else:
+            # Wait until all registered handlers have sent a response
+            # or the timeout is reached.
+            remaining_timeout = self.max_timeout - self.min_timeout
+            self.all_collected.wait(timeout=remaining_timeout)
+            result = [self.handlers[key] for key in self.handlers]
+
+        self._teardown_collection_handlers()
+        return result
 
 
 MessageBusClientConf = namedtuple('MessageBusClientConf',
@@ -197,6 +268,54 @@ class MessageBusClient:
         except WebSocketConnectionClosedException:
             LOG.warning('Could not send %s message because connection '
                         'has been closed', message.msg_type)
+
+    def collect_responses(self, message,
+                          min_timeout=0.2, max_timeout=3.0,
+                          direct_return_func=lambda msg: False):
+        """Collect responses from multiple handlers.
+
+        This sets up a collect-call (pun intended) expecting multiple handlers
+        to respond.
+
+        Args:
+            message (Message): message to send
+            min_timeout (int/float): Minimum time to wait for a response
+            max_timeout (int/float): Maximum allowed time to wait for an answer
+            direct_return_func (callable): Optional function for allowing an
+                early return (not all registered handlers need to respond)
+
+            Returns:
+                (list) collected response messages.
+        """
+        waiter = MessageCollector(self, message,
+                                  min_timeout, max_timeout,
+                                  direct_return_func)
+        return waiter.wait(timeout)
+
+    def on_collect(self, event_name, func):
+        """Create a handler for a collect_responses call.
+
+        This immeditely responds with an ack to register the handler with
+        the caller, promising to return a response.
+
+        The handler function then needs to send a response.
+
+        Args:
+            event_name (str): Message type to listen for.
+            func (callable): function / method do be called for processing the
+                             message.
+        """
+        def wrapper(msg):
+            collect_id = msg.context['__collect_id__']
+            handler_id = str(uuid4())
+            # Immediately respond that something is working on the issue
+            acknowledge = Message(msg.msg_type + '.handling',
+                                  data={'query': collect_id,
+                                        'handler': handler_id})
+            self.emit(acknowledge)
+            func(CollectionMessage.from_message(msg, handler_id, collect_id))
+
+        self.on(event_name, wrapper)
 
     def wait_for_message(self, message_type, timeout=3.0):
         """Wait for a message of a specific type.
