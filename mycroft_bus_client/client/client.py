@@ -173,6 +173,7 @@ class MessageBusClient:
         self.retry = 5
         self.connected_event = Event()
         self.started_running = False
+        self.wrapped_funcs = {}
 
     @staticmethod
     def build_url(host, port, route, ssl):
@@ -290,7 +291,7 @@ class MessageBusClient:
         waiter = MessageCollector(self, message,
                                   min_timeout, max_timeout,
                                   direct_return_func)
-        return waiter.wait(timeout)
+        return waiter.wait()
 
     def on_collect(self, event_name, func):
         """Create a handler for a collect_responses call.
@@ -314,7 +315,7 @@ class MessageBusClient:
                                         'handler': handler_id})
             self.emit(acknowledge)
             func(CollectionMessage.from_message(msg, handler_id, collect_id))
-
+        self.wrapped_funcs[func] = wrapper
         self.on(event_name, wrapper)
 
     def wait_for_message(self, message_type, timeout=3.0):
@@ -373,6 +374,18 @@ class MessageBusClient:
             event_name (str): message type to map to the callback
             func (callable): callback function
         """
+        if func in self.wrapped_funcs:
+            self._remove_wrapped(event_name, func)
+        else:
+            self._remove_normal(event_name, func)
+
+    def _remove_wrapped(self, event_name, external_func):
+        """Remove a wrapped function."""
+
+        wrapper = self.wrapped_funcs.pop(external_func)
+        self._remove_normal(event_name, wrapper)
+
+    def _remove_normal(self, event_name, func):
         try:
             if event_name not in self.emitter._events:
                 LOG.debug("Not able to find '%s'", event_name)
