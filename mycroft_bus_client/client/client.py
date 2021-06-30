@@ -22,7 +22,7 @@ import json
 import logging
 import time
 import traceback
-from threading import Event, Thread
+from threading import Event, Thread, Lock
 from uuid import uuid4
 
 from pyee import ExecutorEventEmitter
@@ -98,6 +98,7 @@ class MessageCollector:
             early return (not all registered handlers need to respond)
     """
     def __init__(self, bus, message, min_timeout, max_timeout, direct_return):
+        self.lock = Lock()
         self.bus = bus
         self.min_timeout = min_timeout
         self.max_timeout = max_timeout
@@ -111,24 +112,32 @@ class MessageCollector:
         self.message.context['__collect_id__'] = self.collect_id
 
     def _register_handler(self, msg):
-        if msg.data['query'] == self.collect_id:
-            self.handlers[msg.data['handler']] = None
+        handler_id = msg.data['handler']
+        with self.lock:
+            if (msg.data['query'] == self.collect_id and
+                    handler_id not in self.handlers):
+                self.handlers[handler_id] = None
 
     def _receive_response(self, msg):
-        if msg.data['query'] == self.collect_id:
-            self.handlers[msg.data['handler']] = msg
-            # If all registered handlers have responded with an answer
-            # or a VERY good answer has been found indicate end of wait.
-            if (all([self.handlers[k] is not None for k in self.handlers]) or
-                    self.direct_return_func(msg)):
-                self.all_collected.set()
+        with self.lock:
+            if msg.data['query'] == self.collect_id:
+                self.handlers[msg.data['handler']] = msg
+                # If all registered handlers have responded with an answer
+                # or a VERY good answer has been found indicate end of wait.
+                all_collected = all(
+                    [self.handlers[k] is not None for k in self.handlers]
+                )
+                if (all_collected or self.direct_return_func(msg)):
+                    self.all_collected.set()
 
     def _setup_collection_handlers(self):
+        """Create messages for handling and responses."""
         base_msg_type = self.message.msg_type
         self.bus.on(base_msg_type + '.handling', self._register_handler)
         self.bus.on(base_msg_type + '.response', self._receive_response)
 
     def _teardown_collection_handlers(self):
+        """Remove all registered handlers for response collection."""
         base_msg_type = self.message.msg_type
         self.bus.remove(base_msg_type + '.handling', self._register_handler)
         self.bus.remove(base_msg_type + '.response', self._receive_response)
